@@ -216,8 +216,9 @@ void *__cheri_compartment("allocator")
  *
  * This will return the size of the allocation claimed on success (which may be
  * larger than the size requested in the original `heap_allocate` call; see its
- * documentation for more information), 0 on error (if `heapCapability` or
- * `pointer` is not valid, etc.), or `-ENOTENOUGHSTACK` if the stack is
+ * documentation for more information), `-EPERM` if `heapCapability` is not
+ * valid or `claim_add` fails, `-EINVAL` if `pointer` is not a valid pointer
+ * into a live heap allocation, or `-ENOTENOUGHSTACK` if the stack is
  * insufficiently large to run the function.
  */
 ssize_t __cheri_compartment("allocator")
