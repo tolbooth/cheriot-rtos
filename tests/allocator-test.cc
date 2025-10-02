@@ -410,11 +410,28 @@ namespace
 		ds::xoroshiro::P32R16 rand = {};
 		auto                  t    = Timeout(0); /* don't sleep */
 
-		std::vector<void *> cachedFrees;
-		cachedFrees.resize(NCachedFrees);
+		/*
+		 * A struct that holds per-heap state for fuzzing. Will come in handy
+		 * when sub-quotas are added.
+		 */
+		struct HeapTestState
+		{
+			AllocatorCapability cap;
+			size_t              quotaSize;
+			const char         *name; // For debug logging
+			std::vector<void *> allocations;
+			std::vector<void *> cachedFrees;
 
-		auto doAlloc = [&](size_t sz) {
-			CHERI::Capability p{heap_allocate(&t, MALLOC_CAPABILITY, sz)};
+			HeapTestState(AllocatorCapability cap, size_t quota, const char *n)
+			  : cap(cap), quotaSize(quota), name(n)
+			{
+				allocations.reserve(MaxAllocs);
+				cachedFrees.resize(NCachedFrees);
+			}
+		};
+
+		auto doAlloc = [&](HeapTestState &heap, size_t sz) {
+			CHERI::Capability p{heap_allocate(&t, heap.cap, sz)};
 
 			if (p.is_valid())
 			{
@@ -422,68 +439,80 @@ namespace
 				TEST(p.length() == sz || p.length() == sz + 8,
 				     "Bad return length");
 				memset(p, 0xCA, sz);
-				allocations.push_back(p);
+				heap.allocations.push_back(p);
 			}
 		};
 
-		auto doFree = [&]() {
-			size_t ix       = rand.next() % allocations.size();
-			void  *p        = allocations[ix];
-			allocations[ix] = allocations.back();
-			allocations.pop_back();
+		auto doFree = [&](HeapTestState &heap) {
+			size_t ix            = rand.next() % heap.allocations.size();
+			void  *p             = heap.allocations[ix];
+			heap.allocations[ix] = heap.allocations.back();
+			heap.allocations.pop_back();
 
 			TEST(CHERI::Capability{p}.is_valid(), "Double free {}", p);
 
-			cachedFrees[rand.next() % NCachedFrees] = p;
+			heap.cachedFrees[rand.next() % NCachedFrees] = p;
 
-			free(p);
+			heap_free(heap.cap, p);
 		};
 
+		// Clear global vector to ensure we're in a clean state
 		allocations.clear();
-		allocations.reserve(MaxAllocs);
+		allocations.shrink_to_fit();
 
-		for (size_t i = 0; i < 8 * TestIterations; ++i)
+		std::vector<HeapTestState> heaps;
+		heaps.emplace_back(
+		  MALLOC_CAPABILITY, MALLOC_QUOTA, "MALLOC_CAPABILITY");
+		heaps.emplace_back(SECOND_HEAP, SECOND_HEAP_QUOTA, "SECOND_HEAP");
+
+		for (auto &heap : heaps)
 		{
-			if ((i & 0x7) == 0)
+			for (size_t i = 0; i < 8 * TestIterations; ++i)
 			{
-				/*
-				 * Some notion of progress on the console is useful, but don't
-				 * be too chatty.
-				 */
-				debug_log("fuzz i={}", i);
-			}
-
-			for (size_t j = rand.next() & 0xF; j > 0; j--)
-			{
-				if (allocations.size() < MaxAllocs)
+				if ((i & 0x7) == 0)
 				{
-					size_t szix = rand.next() % NAllocSizes;
-					size_t sz   = AllocSizes[szix];
-					doAlloc(sz);
+					/*
+					 * Some notion of progress on the console is useful, but
+					 * don't be too chatty.
+					 */
+					debug_log("fuzz i={}", i);
+				}
+
+				for (size_t j = rand.next() & 0xF; j > 0; j--)
+				{
+					if (heap.allocations.size() < MaxAllocs)
+					{
+						size_t szix = rand.next() % NAllocSizes;
+						size_t sz   = AllocSizes[szix];
+						doAlloc(heap, sz);
+					}
+				}
+
+				for (size_t j = rand.next() & 0xF; j > 0; j--)
+				{
+					if (heap.allocations.size() > 0)
+					{
+						doFree(heap);
+					}
+				}
+
+				for (void *p : heap.cachedFrees)
+				{
+					TEST(!Capability{p}.is_valid(),
+					     "Detected necromancy in {}: {}",
+					     heap.name,
+					     p);
 				}
 			}
 
-			for (size_t j = rand.next() & 0xF; j > 0; j--)
+			// Clean up leftover allocations
+			for (auto allocation : heap.allocations)
 			{
-				if (allocations.size() > 0)
-				{
-					doFree();
-				}
+				heap_free(heap.cap, allocation);
 			}
-
-			for (void *p : cachedFrees)
-			{
-				TEST(!Capability{p}.is_valid(), "Detected necromancy: {}", p);
-			}
+			heap.allocations.clear();
+			heap.cachedFrees.clear();
 		}
-
-		cachedFrees.clear();
-
-		for (auto allocation : allocations)
-		{
-			free(allocation);
-		}
-		allocations.clear();
 	}
 
 	void test_claims()
