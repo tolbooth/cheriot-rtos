@@ -419,11 +419,18 @@ namespace
 			AllocatorCapability cap;
 			size_t              quotaSize;
 			const char         *name; // For debug logging
+			bool                canUseHeapFreeAll;
 			std::vector<void *> allocations;
 			std::vector<void *> cachedFrees;
 
-			HeapTestState(AllocatorCapability cap, size_t quota, const char *n)
-			  : cap(cap), quotaSize(quota), name(n)
+			HeapTestState(AllocatorCapability cap,
+			              size_t              quota,
+			              const char         *n,
+			              bool                canFreeAll = true)
+			  : cap(cap),
+			    quotaSize(quota),
+			    name(n),
+			    canUseHeapFreeAll(canFreeAll)
 			{
 				allocations.reserve(MaxAllocs);
 				cachedFrees.resize(NCachedFrees);
@@ -456,16 +463,42 @@ namespace
 			heap_free(heap.cap, p);
 		};
 
+		auto doFreeAll = [&](HeapTestState &heap) {
+			if (heap.allocations.size() == 0)
+			{
+				return;
+			}
+			size_t allocCount = heap.allocations.size();
+
+			// Take a small sample to set up test for revocation failure
+			for (size_t i = 0; i < std::min(allocCount, static_cast<size_t>(4));
+			     i++)
+			{
+				heap.cachedFrees[rand.next() % NCachedFrees] =
+				  heap.allocations[i];
+			}
+
+			ssize_t freed = heap_free_all(heap.cap);
+
+			TEST(freed > 0,
+			     "heap_free_all on {} returned {} but had {} allocations",
+			     heap.name,
+			     freed,
+			     allocCount);
+
+			heap.allocations.clear();
+		};
+
 		// Clear global vector to ensure we're in a clean state
 		allocations.clear();
 		allocations.shrink_to_fit();
 
 		std::vector<HeapTestState> heaps;
 		heaps.emplace_back(
-		  MALLOC_CAPABILITY, MALLOC_QUOTA, "MALLOC_CAPABILITY");
+		  MALLOC_CAPABILITY, MALLOC_QUOTA, "MALLOC_CAPABILITY", false);
 		heaps.emplace_back(SECOND_HEAP, SECOND_HEAP_QUOTA, "SECOND_HEAP");
 
-		for (auto &heap : heaps)
+		for (auto &heapState : heaps)
 		{
 			for (size_t i = 0; i < 8 * TestIterations; ++i)
 			{
@@ -480,38 +513,51 @@ namespace
 
 				for (size_t j = rand.next() & 0xF; j > 0; j--)
 				{
-					if (heap.allocations.size() < MaxAllocs)
+					if (heapState.allocations.size() < MaxAllocs)
 					{
 						size_t szix = rand.next() % NAllocSizes;
 						size_t sz   = AllocSizes[szix];
-						doAlloc(heap, sz);
+						doAlloc(heapState, sz);
 					}
 				}
 
-				for (size_t j = rand.next() & 0xF; j > 0; j--)
+				/*
+				 * Decide whether to free individually or use heap_free_all.
+				 * We use heap_free_all ~10% of the time (when allowed).
+				 * This exercises the functionality without adding too much
+				 * overhead or detracting from heap_free fuzzing.
+				 */
+				if (heapState.canUseHeapFreeAll && ((rand.next() & 0x7) < 1))
 				{
-					if (heap.allocations.size() > 0)
+					doFreeAll(heapState);
+				}
+				else
+				{
+					for (size_t j = rand.next() & 0xF; j > 0; j--)
 					{
-						doFree(heap);
+						if (heapState.allocations.size() > 0)
+						{
+							doFree(heapState);
+						}
 					}
 				}
 
-				for (void *p : heap.cachedFrees)
+				for (void *p : heapState.cachedFrees)
 				{
 					TEST(!Capability{p}.is_valid(),
 					     "Detected necromancy in {}: {}",
-					     heap.name,
+					     heapState.name,
 					     p);
 				}
 			}
 
 			// Clean up leftover allocations
-			for (auto allocation : heap.allocations)
+			for (auto allocation : heapState.allocations)
 			{
-				heap_free(heap.cap, allocation);
+				heap_free(heapState.cap, allocation);
 			}
-			heap.allocations.clear();
-			heap.cachedFrees.clear();
+			heapState.allocations.clear();
+			heapState.cachedFrees.clear();
 		}
 	}
 
