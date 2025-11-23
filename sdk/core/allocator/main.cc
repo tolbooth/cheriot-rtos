@@ -859,7 +859,7 @@ namespace
 			return -EINVAL;
 		}
 		ptraddr_t start    = chunk->body().address();
-		size_t    bodySize = gm->chunk_body_size(*chunk);
+		size_t    bodySize = chunk->body_size();
 		// Is the pointer that we're freeing a pointer to the entire allocation?
 		bool isPrecise = (start == mem.base()) && (bodySize == mem.length());
 		return heap_free_chunk(
@@ -979,7 +979,7 @@ __cheriot_minimum_stack(0x1c0) ssize_t
 	}
 	if (claim_add(*cap, *chunk))
 	{
-		return gm->chunk_body_size(*chunk);
+		return chunk->body_size();
 	}
 	Debug::log<DebugLevel::Warning>("failed to add claim");
 	return -ENOMEM;
@@ -1050,8 +1050,7 @@ __cheriot_minimum_stack(0x1a0) ssize_t
 		if (chunk->is_in_use() && !chunk->isSealedObject)
 		{
 			auto size = chunk->size_get();
-			if (heap_free_chunk(
-			      *capability, *chunk, gm->chunk_body_size(*chunk)) == 0)
+			if (heap_free_chunk(*capability, *chunk, chunk->body_size()) == 0)
 			{
 				freed += size;
 			}

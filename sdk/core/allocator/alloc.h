@@ -409,6 +409,31 @@ __cheri_no_subobject_bounds MChunkHeader
 		return ds::pointer::offset<T>(this, sizeof(MChunkHeader));
 	}
 
+	/**
+	 * Returns the size of the user-visible allocation associated with this
+	 * chunk.
+	 */
+	size_t body_size()
+	{
+		size_t    bodySize = size_get() - sizeof(MChunkHeader);
+		ptraddr_t base     = body().address();
+		if (!CHERI::is_precise_range(base, bodySize))
+		{
+			/*
+			 * If we can't give a precise capability covering the whole chunk,
+			 * then we must have given out the representable portion.
+			 * See also the logic in mspace_dispatch().
+			 */
+			bodySize -= MallocAlignment;
+			Debug::Assert(
+			  CHERI::is_precise_range(base, bodySize),
+			  "Neither bodySize nor bodySize - 8 can give a precise "
+			  "capability. "
+			  "Something is wrong during allocation.");
+		}
+		return bodySize;
+	}
+
 	static MChunkHeader *from_body(void *body)
 	{
 		return ds::pointer::offset<MChunkHeader>(body, -sizeof(MChunkHeader));
@@ -1240,31 +1265,6 @@ class MState
 			              alignSize);
 		}
 		return ret;
-	}
-
-	/**
-	 * Returns
-	 * the size of the allocation associated with `chunk`.
-	 */
-	size_t chunk_body_size(MChunkHeader &chunk) const
-	{
-		size_t    bodySize = chunk.size_get() - sizeof(MChunkHeader);
-		ptraddr_t base     = chunk.body().address();
-		if (!CHERI::is_precise_range(base, bodySize))
-		{
-			/*
-			 * If we can't give a precise capability covering the whole chunk,
-			 * then we must have given out the representable portion.
-			 * See also the logic in mspace_dispatch().
-			 */
-			bodySize -= MallocAlignment;
-			Debug::Assert(
-			  CHERI::is_precise_range(base, bodySize),
-			  "Neither bodySize nor bodySize - 8 can give a precise "
-			  "capability. "
-			  "Something is wrong during allocation.");
-		}
-		return bodySize;
 	}
 
 	/**
