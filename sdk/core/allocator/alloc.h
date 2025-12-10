@@ -81,77 +81,91 @@ static inline BIndex bit2idx(Binmap x)
 	return ctz(x);
 }
 
-// Return treebin index for size s.
-static inline BIndex compute_tree_index(size_t s)
+namespace TreeBinIndex
 {
-	/*
-	 * The upper bits of the size after TreeBinShift, if larger than this, must
-	 * be thrown into the largest bin. Every two tree bins handle one
-	 * power-of-two.
+	static constexpr size_t Count   = NTreeBins;
+	static constexpr size_t MinSize = MaxSmallSize;
+
+	// Return treebin index for size s.
+	static inline BIndex index(size_t s)
+	{
+		/*
+		 * The upper bits of the size after TreeBinShift, if larger than this,
+		 * must be thrown into the largest bin. Every two tree bins handle one
+		 * power-of-two.
+		 */
+		constexpr size_t MaxTreeComputeMask = (1U << (Count >> 1)) - 1;
+
+		size_t x = s >> TreeBinShift, k;
+		if (x == 0)
+		{
+			return 0;
+		}
+		if (x > MaxTreeComputeMask)
+		{
+			return Count - 1;
+		}
+		k          = utils::bytes2bits(sizeof(x)) - 1 - clz(x);
+		BIndex ret = (k << 1) + ((s >> (k + (TreeBinShift - 1)) & 1));
+		Debug::Assert(
+		  ret < Count, "Return value {} is out of range 0-{}", ret, Count);
+		return ret;
+	}
+
+	// shift placing maximum resolved bit in a treebin at i as sign bit
+	static inline constexpr size_t leftshift(BIndex i)
+	{
+		return i == Count - 1 ? 0
+		                      : (BitsInSizeT - ((i >> 1) + TreeBinShift - 1U));
+	}
+
+	/**
+	 * After size << TreeBinIndex::leftshift, the bit to be resolved must be at
+	 * the sign bit. Checking if the bit is 1 only needs to check val < 0. This
+	 * assumes 2's complement.
+	 *
+	 * @param val the value already shifted by TreeBinIndex::leftshift()
 	 */
-	constexpr size_t MaxTreeComputeMask = (1U << (NTreeBins >> 1)) - 1;
-
-	size_t x = s >> TreeBinShift, k;
-	if (x == 0)
+	static inline size_t leftshifted_val_msb(size_t val)
 	{
-		return 0;
+		return static_cast<ssize_t>(val) < 0 ? 1 : 0;
 	}
-	if (x > MaxTreeComputeMask)
+
+	// the size of the smallest chunk held in bin with index i
+	static inline constexpr size_t min_size(BIndex i)
 	{
-		return NTreeBins - 1;
+		return (1U << ((i >> 1) + TreeBinShift)) |
+		       ((1U & i) << ((i >> 1) + TreeBinShift - 1));
 	}
-	k          = utils::bytes2bits(sizeof(x)) - 1 - clz(x);
-	BIndex ret = (k << 1) + ((s >> (k + (TreeBinShift - 1)) & 1));
-	Debug::Assert(
-	  ret < NTreeBins, "Return value {} is out of range 0-{}", ret, NTreeBins);
-	return ret;
-}
+} // namespace TreeBinIndex
 
-// shift placing maximum resolved bit in a treebin at i as sign bit
-static inline size_t leftshift_for_tree_index(BIndex i)
+namespace SmallBinIndex
 {
-	return i == NTreeBins - 1 ? 0
-	                          : (BitsInSizeT - ((i >> 1) + TreeBinShift - 1U));
-}
+	static constexpr size_t Count   = NSmallBins;
+	static constexpr size_t MaxSize = MaxSmallSize;
 
-/**
- * After size << leftshift_for_tree_index, the bit to be resolved must be at the
- * sign bit. Checking if the bit is 1 only needs to check val < 0. This assumes
- * 2's complement.
- *
- * @param val the value already shifted by leftshift_for_tree_index()
- */
-static inline size_t leftshifted_val_msb(size_t val)
-{
-	return static_cast<ssize_t>(val) < 0 ? 1 : 0;
-}
+	/**
+	 * The index of the small bin this size should live in.
+	 * Size 1 to MallocAlignment live in bin 0, MallocAlignment + 1 to
+	 * 2 * MallocAlignment live in bin 1, etc.
+	 */
+	static inline constexpr BIndex index(size_t s)
+	{
+		return (s - 1) >> SmallBinShift;
+	}
 
-// the size of the smallest chunk held in bin with index i
-static inline size_t minsize_for_tree_index(BIndex i)
-{
-	return (1U << ((i >> 1) + TreeBinShift)) |
-	       ((1U & i) << ((i >> 1) + TreeBinShift - 1));
-}
+	// Is this a smallbin size?
+	static inline constexpr bool is_small(size_t s)
+	{
+		return index(s) < Count;
+	}
 
-/**
- * The index of the small bin this size should live in.
- * Size 1 to MallocAlignment live in bin 0, MallocAlignment + 1 to
- * 2 * MallocAlignment live in bin 1, etc.
- */
-static inline BIndex small_index(size_t s)
-{
-	return (s - 1) >> SmallBinShift;
-}
-// Is this a smallbin size?
-static inline bool is_small(size_t s)
-{
-	return small_index(s) < NSmallBins;
-}
-// Convert smallbin index to the size it contains.
-static inline size_t small_index2size(BIndex i)
-{
-	return (static_cast<size_t>(i) + 1) << SmallBinShift;
-}
+	// Convert smallbin index to the size it contains.
+	static inline constexpr size_t size_for_index(BIndex i)
+	{
+		return (static_cast<size_t>(i) + 1) << SmallBinShift;
+	}
+} // namespace SmallBinIndex
 
 namespace displacement_proxy
 {
@@ -1738,18 +1752,18 @@ class MState
 		auto   tHeader = MChunkHeader::from_body(t);
 		BIndex tindex  = t->index;
 		size_t tsize   = tHeader->size_get();
-		BIndex idx     = compute_tree_index(tsize);
+		BIndex idx     = TreeBinIndex::index(tsize);
 		Debug::Assert(
 		  tindex == idx, "Chunk index {}, expected {}", tindex, idx);
 		Debug::Assert(tsize > MaxSmallSize,
 		              "Size {} is smaller than the minimum size",
 		              tsize);
-		Debug::Assert(tsize >= minsize_for_tree_index(idx),
+		Debug::Assert(tsize >= TreeBinIndex::min_size(idx),
 		              "Size {} is smaller than the minimum size for tree {}",
 		              tsize,
 		              idx);
 		Debug::Assert((idx == NTreeBins - 1) ||
-		                (tsize < minsize_for_tree_index((idx + 1))),
+		                (tsize < TreeBinIndex::min_size((idx + 1))),
 		              "Tree shape is invalid");
 
 		/* Properties of this tree node */
@@ -1871,10 +1885,10 @@ class MState
 
 			// Chunk belongs in this bin.
 			size_t size = pHeader->size_get();
-			Debug::Assert(small_index(size) == i,
+			Debug::Assert(SmallBinIndex::index(size) == i,
 			              "Chunk is in bin with index {} but should be in {}",
 			              i,
-			              small_index(size));
+			              SmallBinIndex::index(size));
 
 			return false;
 		});
@@ -1911,7 +1925,7 @@ class MState
 	 */
 	void insert_small_chunk(MChunkHeader *p, size_t size)
 	{
-		BIndex i   = small_index(size);
+		BIndex i   = SmallBinIndex::index(size);
 		auto   bin = smallbin_at(i);
 		Debug::Assert(
 		  size >= MinChunkSize, "Size {} is not a small chunk size", size);
@@ -1938,17 +1952,17 @@ class MState
 		auto   br      = p->ring.cell_prev();
 		auto  *b       = MChunk::from_ring(br);
 		auto   pHeader = MChunkHeader::from_body(p);
-		BIndex i       = small_index(s);
+		BIndex i       = SmallBinIndex::index(s);
 		auto   bin     = smallbin_at(i);
 
 		Debug::Assert(!ds::linked_list::is_singleton(&p->ring),
 		              "Chunk {} is circularly referenced",
 		              p);
-		Debug::Assert(pHeader->size_get() == small_index2size(i),
+		Debug::Assert(pHeader->size_get() == SmallBinIndex::size_for_index(i),
 		              "Chunk {} is has size {} but is in bin for size {}",
 		              pHeader,
 		              pHeader->size_get(),
-		              small_index2size(i));
+		              SmallBinIndex::size_for_index(i));
 
 		if (RTCHECK(&p->ring == bin->last() ||
 		            (ok_address(f->ptr()) && f->bk_equals(p))))
@@ -2000,11 +2014,11 @@ class MState
 		p->metadata_clear();
 
 		MChunkHeader *pHeader = MChunkHeader::from_body(p);
-		Debug::Assert(pHeader->size_get() == small_index2size(i),
+		Debug::Assert(pHeader->size_get() == SmallBinIndex::size_for_index(i),
 		              "Chunk {} is has size {} but is in bin for size {}",
 		              pHeader,
 		              pHeader->size_get(),
-		              small_index2size(i));
+		              SmallBinIndex::size_for_index(i));
 
 		return pHeader;
 	}
@@ -2017,7 +2031,7 @@ class MState
 	void insert_large_chunk(MChunkHeader *xHeader, size_t s)
 	{
 		TChunk **head;
-		BIndex   i = compute_tree_index(s);
+		BIndex   i = TreeBinIndex::index(s);
 		head       = treebin_at(i);
 
 		if (!is_treemap_marked(i))
@@ -2028,13 +2042,13 @@ class MState
 		else
 		{
 			TChunk *t = *head;
-			size_t  k = s << leftshift_for_tree_index(i);
+			size_t  k = s << TreeBinIndex::leftshift(i);
 			for (;;)
 			{
 				if (MChunkHeader::from_body(t)->size_get() != s)
 				{
 					CHERI::Capability<TChunk *> c =
-					  &(t->child[leftshifted_val_msb(k)]);
+					  &(t->child[TreeBinIndex::leftshifted_val_msb(k)]);
 					k <<= 1;
 					if (*c != nullptr)
 					{
@@ -2199,7 +2213,7 @@ class MState
 	 */
 	void insert_chunk(MChunkHeader *p, size_t s)
 	{
-		if (is_small(s))
+		if (SmallBinIndex::is_small(s))
 		{
 			insert_small_chunk(p, s);
 		}
@@ -2212,7 +2226,7 @@ class MState
 	// Unlink p from the correct bin based on s.
 	void unlink_chunk(MChunk *p, size_t s)
 	{
-		if (is_small(s))
+		if (SmallBinIndex::is_small(s))
 		{
 			unlink_small_chunk(p, s);
 		}
@@ -2308,11 +2322,11 @@ class MState
 		TChunk *v     = nullptr;
 		size_t  rsize = -nb; // unsigned negation
 		TChunk *t;
-		BIndex  idx = compute_tree_index(nb);
+		BIndex  idx = TreeBinIndex::index(nb);
 		if ((t = *treebin_at(idx)) != nullptr)
 		{
 			// Traverse tree for this bin looking for node with size >= nb.
-			size_t  sizebits = nb << leftshift_for_tree_index(idx);
+			size_t  sizebits = nb << TreeBinIndex::leftshift(idx);
 			TChunk *rst      = nullptr; // the deepest untaken right subtree
 			for (;;)
 			{
@@ -2328,7 +2342,7 @@ class MState
 					}
 				}
 				rt = t->child[1];
-				t  = t->child[leftshifted_val_msb(sizebits)];
+				t  = t->child[TreeBinIndex::leftshifted_val_msb(sizebits)];
 				if (rt != nullptr && rt != t)
 				{
 					rst = rt;
@@ -2648,7 +2662,7 @@ class MState
 			BIndex idx;
 			Binmap smallbits;
 			nb  = (bytes < MinRequest) ? MinChunkSize : pad_request(bytes);
-			idx = small_index(nb);
+			idx = SmallBinIndex::index(nb);
 			smallbits = smallmap >> idx;
 
 			if (smallbits & 0x1U)
@@ -2666,7 +2680,7 @@ class MState
 				Binmap leastbit = ds::bits::isolate_least(leftbits);
 				BIndex i        = bit2idx(leastbit);
 				auto   p        = unlink_first_small_chunk(i);
-				size_t rsize    = small_index2size(i) - nb;
+				size_t rsize    = SmallBinIndex::size_for_index(i) - nb;
 
 				if (rsize >= MinChunkSize)
 				{
@@ -2882,7 +2896,7 @@ class MState
 					RenderDebug::log("   free ring empty");
 				}
 
-				if (!is_small(header->size_get()))
+				if (!SmallBinIndex::is_small(header->size_get()))
 				{
 					auto t = TChunk::from_mchunk(chunk);
 
