@@ -16,7 +16,7 @@
  * size requirements for these.  This is occasionally visible to its clients,
  * as documented on interface functions below.
  */
-static const size_t CHERIOTHeapMinChunkSize = 16;
+static const size_t CHERIOTHeapMinChunkSize = 24;
 
 /**
  * `MALLOC_QUOTA` sets the quota for the current compartment for use with

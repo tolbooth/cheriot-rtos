@@ -247,6 +247,21 @@ namespace displacement_proxy
 
 } // namespace displacement_proxy
 
+// Forward declaration for footer
+struct MChunkHeader;
+
+/**
+ * Footer stored at the end of free chunks to allow for backward traversal.
+ * Stores a capability pointing to the chunk header.
+ */
+struct __packed __aligned(MallocAlignment) MChunkFooter
+{
+	/**
+	 * Capability pointing to this chunk's header. See cell_prev().
+	 */
+	MChunkHeader *prev;
+};
+
 /**
  * Every chunk, in use or not, includes a minimal header.  That is, this is a
  * classic malloc, not something like a slab or sizeclass allocator or a
@@ -291,9 +306,9 @@ __cheri_no_subobject_bounds MChunkHeader
 	 */
 	static constexpr size_t OwnerIDWidth = 13;
 	/**
-	 * Compressed size of the predecessor chunk.  See cell_prev().
+	 * Reserved space.
 	 */
-	SmallSize prevSize;
+	uint16_t reserved;
 	/**
 	 * Compressed size of this chunk.  See cell_next().
 	 */
@@ -315,9 +330,16 @@ __cheri_no_subobject_bounds MChunkHeader
 
 	__always_inline auto cell_prev()
 	{
-		return displacement_proxy::
-		  Proxy<MChunkHeader, SmallSize, false, head2size, size2head>(this,
-		                                                              prevSize);
+		Debug::Invariant(
+		  !isPrevInUse,
+		  "This should not be called with the previous chunk in use.");
+
+		// Fetch the head of the previous chunk by reading its footer.
+		char         *currAddress = reinterpret_cast<char *>(this);
+		MChunkFooter *footer =
+		  reinterpret_cast<MChunkFooter *>(currAddress - sizeof(MChunkFooter));
+
+		return ds::pointer::proxy::Pointer(footer->prev);
 	}
 
 	__always_inline auto cell_next()
@@ -375,7 +397,10 @@ __cheri_no_subobject_bounds MChunkHeader
 	// size of the previous chunk
 	size_t prevsize_get()
 	{
-		return head2size(prevSize);
+		char         *currAddress = reinterpret_cast<char *>(this);
+		MChunkFooter *footer =
+		  reinterpret_cast<MChunkFooter *>(currAddress - sizeof(MChunkFooter));
+		return footer->prev->size_get();
 	}
 
 	// size of this chunk
@@ -433,13 +458,22 @@ __cheri_no_subobject_bounds MChunkHeader
 	{
 		auto newloc = ds::pointer::offset<void>(this, offset);
 
+		// Get the current size and the next chunk before modifying
+		size_t originalSize = size_get();
+		auto   next         = cell_next();
+
 		auto newnext = new (newloc) MChunkHeader();
 		newnext->clear();
 		// Invariant that headers must point to shadow bits that are set.
 		revoker.shadow_paint_single(CHERI::Capability{newloc}.address(), true);
 
-		ds::linked_list::emplace_after(this, newnext);
+		// This chunk becomes 'offset' size, newnext gets the rest
+		currSize             = size2head(offset);
+		newnext->currSize    = size2head(originalSize - offset);
 		newnext->isCurrInUse = newnext->isPrevInUse = isCurrInUse;
+
+		// Update the next chunk's isPrevInUse to match newnext's state
+		next->isPrevInUse = newnext->isCurrInUse;
 
 		return newnext;
 	}
@@ -469,7 +503,6 @@ __cheri_no_subobject_bounds MChunkHeader
 		auto footer =
 		  new (ds::pointer::offset<void>(base, size)) MChunkHeader();
 		footer->clear();
-		footer->prevSize    = size;
 		footer->currSize    = size2head(sizeof(MChunkHeader));
 		footer->isPrevInUse = false;
 		footer->isCurrInUse = true;
@@ -662,6 +695,19 @@ class __packed __aligned(MallocAlignment) MChunk
 		static_assert(sizeof(ring) == sizeof(uintptr_t));
 		*reinterpret_cast<uintptr_t *>(&this->ring) = 0;
 	}
+
+	/**
+	 * Write a capability to this chunk's header into the footer.
+	 * This is used by `cell_prev()` to traverse backward through free chunks.
+	 */
+	__always_inline void write_footer()
+	{
+		auto          header = MChunkHeader::from_body(this);
+		char         *base   = reinterpret_cast<char *>(this);
+		MChunkFooter *footer = reinterpret_cast<MChunkFooter *>(
+		  base + header->size_get() - sizeof(MChunkFooter));
+		footer->prev = header;
+	}
 };
 
 class MChunkAssertions
@@ -671,8 +717,9 @@ class MChunkAssertions
 };
 
 // the minimum size of a chunk (including the header)
-constexpr size_t MinChunkSize =
-  (sizeof(MChunkHeader) + sizeof(MChunk) + MallocAlignMask) & ~MallocAlignMask;
+constexpr size_t MinChunkSize = (sizeof(MChunkHeader) + sizeof(MChunk) +
+                                 sizeof(MChunkFooter) + MallocAlignMask) &
+                                ~MallocAlignMask;
 // the minimum size of a chunk (excluding the header)
 constexpr size_t MinRequest = MinChunkSize - sizeof(MChunkHeader);
 
@@ -1073,6 +1120,7 @@ class MState
 
 		heapTotalSize += size;
 		heapFreeSize += p->size_get();
+		MChunk::from_header(p)->write_footer();
 		insert_chunk(p, p->size_get());
 	}
 
@@ -2283,6 +2331,7 @@ class MState
 				 * allocation, place it into the free list.
 				 */
 				auto r = vHeader->split(nb);
+				MChunk::from_header(r)->write_footer();
 				insert_chunk(r, rsize);
 			}
 
@@ -2428,6 +2477,7 @@ class MState
 
 		p->mark_free();
 
+		MChunk::from_header(p)->write_footer();
 		insert_chunk(p, p->size_get());
 		ok_free_chunk(p);
 	}
@@ -2671,6 +2721,7 @@ class MState
 				if (rsize >= MinChunkSize)
 				{
 					auto r = p->split(nb);
+					MChunk::from_header(r)->write_footer();
 					insert_small_chunk(r, rsize);
 				}
 				p->mark_in_use();
