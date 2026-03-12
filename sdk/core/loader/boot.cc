@@ -757,35 +757,36 @@ namespace
 		}
 		// The import table might not have strongly aligned bounds and so we
 		// are happy with an imprecise capability here.
-		auto impPtr = build<ImportTable,
-		                    Root::Type::RWGlobal,
-		                    Root::Permissions<Root::Type::RWGlobal>,
-		                    false>(importTable);
-		// FIXME: This should use a range-based for loop
-		for (int i = 0; i < (importTable.size() / sizeof(void *)) - 1; i++)
+		auto importTablePointer = build<ImportTable,
+		                                Root::Type::RWGlobal,
+		                                Root::Permissions<Root::Type::RWGlobal>,
+		                                false>(importTable);
+
+		for (auto &import : ContiguousPtrRange<ImportEntry>{
+		       importTablePointer->imports,
+		       importTablePointer->imports +
+		         (importTable.size() / sizeof(void *) - 1)})
 		{
-			ptraddr_t importAddr = impPtr->imports[i].address;
-			size_t    importSize = impPtr->imports[i].size();
 			// If the size is not 0, this isn't an import table entry.
-			if (importSize != 0)
+			if (import.size() != 0)
 			{
 				continue;
 			}
 			// If the low bit is 1, it's either a library import or an MMIO
 			// import.  Skip it either way.
-			if (importAddr & 1)
+			if (import.address & 1)
 			{
 				continue;
 			}
 			// If this points anywhere other than the current compartment's
 			// export table, it isn't a sealing capability entry.
-			if (!contains(compartment.exportTable, importAddr))
+			if (!contains(compartment.exportTable, import.address))
 			{
 				continue;
 			}
 			// Build an export table entry for the given compartment.
 			auto exportEntry =
-			  build<ExportEntry>(compartment.exportTable, importAddr);
+			  build<ExportEntry>(compartment.exportTable, import.address);
 
 			// If the export entry isn't a sealing type, this is not a
 			// reference to a sealing capability.
@@ -801,7 +802,7 @@ namespace
 			exportEntry->functionStart = allocate_static_sealing_key();
 			Debug::log("Creating sealing key {}", exportEntry->functionStart);
 			// Build the sealing key corresponding to that type.
-			impPtr->imports[i].pointer =
+			import.pointer =
 			  build_static_sealing_key(exportEntry->functionStart);
 		}
 	}
@@ -831,18 +832,21 @@ namespace
 		                                false>(importTable);
 
 		importTablePointer->switcher = switcher;
-		// FIXME: This should use a range-based for loop
-		for (int i = 0; i < (importTable.size() / sizeof(void *)) - 1; i++)
+
+		for (auto &import : ContiguousPtrRange<ImportEntry>{
+		       importTablePointer->imports,
+		       importTablePointer->imports +
+		         (importTable.size() / sizeof(void *) - 1)})
 		{
 			// If this is a sealing key then we will have initialised it
 			// already, skip it now.
-			if (Capability{importTablePointer->imports[i].pointer}.is_valid())
+			if (Capability{import.pointer}.is_valid())
 			{
 				Debug::log("Skipping sealing type import");
 				continue;
 			}
-			importTablePointer->imports[i].pointer = find_export_target(
-			  image, sourceCompartment, importTablePointer->imports[i]);
+			import.pointer =
+			  find_export_target(image, sourceCompartment, import);
 		}
 	}
 

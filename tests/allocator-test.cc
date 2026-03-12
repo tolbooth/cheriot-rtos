@@ -1471,6 +1471,67 @@ namespace
 		debug_log("End of permission restriction tests");
 	}
 
+	/**
+	 * FIXME: Here lies the problematic test case.
+	 */
+	__noinline void test_sub_quota_semantics()
+	{
+		debug_log("Beginning sub quota semantics tests");
+
+		Timeout               t{UnlimitedTimeout};
+		ds::xoroshiro::P32R16 rand = {};
+
+		const size_t        ArrSize   = 32;
+		AllocatorCapability quotas[ArrSize];
+		void               *ptrs[ArrSize];
+
+		size_t initialQuota   = heap_quota_remaining(MALLOC_CAPABILITY);
+		size_t allocationSize = 128;
+		size_t splitSize =
+		  allocationSize + (2 * sizeof(AllocatorCapabilityState));
+
+		// We should be able to arbitrarily nest sub quotas, and recombing
+		// should propagate ownership of allocations up to the top.
+
+		quotas[0] = MALLOC_CAPABILITY;
+		ptrs[0]   = heap_allocate(&t, MALLOC_CAPABILITY, allocationSize);
+		TEST(Capability{ptrs[0]}.is_valid(), "Root allocation failed");
+
+		for (size_t i = 1; i < ArrSize; ++i)
+		{
+			quotas[i] =
+			  split_sub_quota(&t, quotas[i - 1], (ArrSize - i) * splitSize);
+			TEST(Capability{quotas[i]}.is_valid_temporal(),
+			     "split failed at index {}",
+			     i);
+			ptrs[i] = heap_allocate(&t, quotas[i], allocationSize);
+			TEST(Capability{ptrs[i]}.is_valid_temporal(),
+			     "allocation failed at index {}",
+			     i);
+		}
+
+		// This loop fails on its second iteration.
+		for (size_t i = ArrSize - 1; i > 0; i = i - 1)
+		{
+			int result = recombine_sub_quota(quotas[i], quotas[i - 1]);
+			TEST(result == 0,
+			     "Recombine failed at index {} with code {}",
+			     i,
+			     result);
+		}
+
+		for (size_t i = 0; i < ArrSize; ++i)
+		{
+			TEST(heap_free(MALLOC_CAPABILITY, ptrs[i]) == 0,
+			     "Free failed at index {}",
+			     i);
+		}
+
+		TEST_EQUAL(heap_quota_remaining(MALLOC_CAPABILITY),
+		           initialQuota,
+		           "Full quota not recovered");
+	}
+
 } // namespace
 
 /**
@@ -1541,6 +1602,7 @@ int test_allocator()
 	     quotaLeft);
 	test_claims();
 	test_permissions();
+	test_sub_quota_semantics();
 
 	TEST(heap_address_is_valid(&t) == false,
 	     "Stack object incorrectly reported as heap address");
